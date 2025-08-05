@@ -22,6 +22,19 @@ app.use(cors());
 
 app.use(express.json());
 
+// Helper function to update progress
+const updateProgress = async (generationId, progress, message) => {
+    await supabase
+        .from('label_generations')
+        .update({ 
+            progress: progress,
+            progress_message: message,
+            // updated_at: new Date().toISOString()
+        })
+        .eq('id', generationId);
+    console.log(`Progress ${progress}%: ${message}`);
+};
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
@@ -39,6 +52,9 @@ app.post('/generate-pdf', async (req, res) => {
         }
 
         const { generationId } = req.body;
+
+        // Update progress: Starting
+        await updateProgress(generationId, 10, 'Fetching generation data...');
 
         // Fetch data from Supabase
         console.log(`Fetching data for generation ID: ${generationId}`);
@@ -80,11 +96,17 @@ app.post('/generate-pdf', async (req, res) => {
 
         console.log(`Processing ${labels.length} labels with template: ${templateType}`);
 
+        // Update progress: Data fetched
+        await updateProgress(generationId, 20, 'Launching browser...');
+
         // Launch browser
         browser = await puppeteer.launch({
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
+
+        await updateProgress(generationId, 30, 'Navigating to print page...');
+
         const page = await browser.newPage();
 
         // Optimize page
@@ -103,9 +125,13 @@ app.post('/generate-pdf', async (req, res) => {
             timeout: 60000
         });
 
+        await updateProgress(generationId, 60, 'Waiting for content to load...');
+
         // Wait for dynamic content
         const waitTime = Math.min(2000 + (labels.length * 100), 10000);
         await new Promise(resolve => setTimeout(resolve, waitTime));
+
+        await updateProgress(generationId, 80, 'Generating PDF...');
 
         // Convert dimensions
         const convertDimension = (value, unit) => {
@@ -131,6 +157,8 @@ app.post('/generate-pdf', async (req, res) => {
         });
 
         console.log(`PDF generated successfully: ${pdf.length} bytes for ${labels.length} labels`);
+
+        await updateProgress(generationId, 100, 'PDF generated successfully');
 
         // Update Supabase record with success
         await supabase
