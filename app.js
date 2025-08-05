@@ -137,6 +137,7 @@ app.post('/generate-pdf', async (req, res) => {
             .from('label_generations')
             .update({
                 status: 'completed',
+                error_message: null,
                 processed_at: new Date().toISOString(),
                 pdf_size: pdf.length
             })
