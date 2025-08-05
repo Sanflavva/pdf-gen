@@ -1,8 +1,19 @@
+import 'dotenv/config';
 import express from 'express';
 import puppeteer from 'puppeteer';
 import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
 
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 
+if (!supabaseUrl || !supabaseKey) {
+    console.error('Missing Supabase environment variables. Please set SUPABASE_URL and SUPABASE_ANON_KEY');
+    process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 const app = express();
 
@@ -20,14 +31,41 @@ app.get('/health', (req, res) => {
 app.post('/generate-pdf', async (req, res) => {
     let browser = null;
     try {
-        // Check if request body exists and is not empty
-        if (!req.body || Object.keys(req.body).length === 0) {
+        // Check if request body exists and has generationId
+        if (!req.body || !req.body.generationId) {
             return res.status(400).json({
-                error: 'No data provided. Please send a valid JSON payload with labels, templateType, dimensions, and barcodeSource.'
+                error: 'No generationId provided. Please send a valid JSON payload with generationId.'
             });
         }
 
-        const { labels, templateType, dimensions, barcodeSource } = req.body;
+        const { generationId } = req.body;
+
+        // Fetch data from Supabase
+        console.log(`Fetching data for generation ID: ${generationId}`);
+        const { data: generationData, error: fetchError } = await supabase
+            .from('label_generations')
+            .select('*')
+            .eq('id', generationId)
+            .single();
+
+        if (fetchError) {
+            console.error('Supabase fetch error:', fetchError);
+            return res.status(500).json({ error: `Failed to fetch generation data: ${fetchError.message}` });
+        }
+
+        if (!generationData) {
+            return res.status(404).json({ error: 'Generation not found' });
+        }
+
+        // Update status to processing
+        await supabase
+            .from('label_generations')
+            .update({ status: 'processing' })
+            .eq('id', generationId);
+
+        // Extract data from the fetched record
+        const { payload, template_type: templateType, dimensions, barcode_source: barcodeSource } = generationData;
+        const labels = payload.labels || payload; // Handle both formats
 
         // Validation
         if (!labels || !Array.isArray(labels) || labels.length === 0) {
@@ -94,6 +132,16 @@ app.post('/generate-pdf', async (req, res) => {
 
         console.log(`PDF generated successfully: ${pdf.length} bytes for ${labels.length} labels`);
 
+        // Update Supabase record with success
+        await supabase
+            .from('label_generations')
+            .update({
+                status: 'completed',
+                processed_at: new Date().toISOString(),
+                pdf_size: pdf.length
+            })
+            .eq('id', generationId);
+
         // Send PDF response
         res.set({
             'Content-Type': 'application/pdf',
@@ -104,6 +152,19 @@ app.post('/generate-pdf', async (req, res) => {
 
     } catch (error) {
         console.error('PDF generation error:', error);
+
+        // Update Supabase record with error if generationId exists
+        if (req.body && req.body.generationId) {
+            await supabase
+                .from('label_generations')
+                .update({
+                    status: 'failed',
+                    error_message: error.message,
+                    processed_at: new Date().toISOString()
+                })
+                .eq('id', req.body.generationId);
+        }
+
         res.status(500).json({ error: `PDF generation failed: ${error.message}` });
     } finally {
         if (browser) {
@@ -114,6 +175,6 @@ app.post('/generate-pdf', async (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 8080;
-app.listen(8080, () => {
+app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
