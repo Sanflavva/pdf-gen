@@ -3,6 +3,7 @@ import express from 'express';
 import puppeteer from 'puppeteer';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
+import { PDFDocument } from 'pdf-lib';
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -112,28 +113,21 @@ app.post('/generate-pdf', async (req, res) => {
         // Optimize page
         await page.setViewport({ width: 1200, height: 800 });
 
-        // Construct print URL
-        const printUrl = new URL('https://lavvel.sanflavva.com/print-labels');
-        printUrl.searchParams.set('templateType', templateType);
-        printUrl.searchParams.set('dimensions', JSON.stringify(dimensions));
-        printUrl.searchParams.set('labels', JSON.stringify(labels));
-        printUrl.searchParams.set('barcodeSource', barcodeSource);
+        // Split labels into chunks of 20 if more than 20 labels
+        const chunkSize = 20;
+        const labelChunks = [];
 
-        console.log('Navigating to print route...');
-        await page.goto(printUrl.toString(), {
-            waitUntil: 'networkidle0',
-            timeout: 60000
-        });
+        if (labels.length > chunkSize) {
+            for (let i = 0; i < labels.length; i += chunkSize) {
+                labelChunks.push(labels.slice(i, i + chunkSize));
+            }
+            console.log(`Split ${labels.length} labels into ${labelChunks.length} chunks of max ${chunkSize} labels each`);
+        } else {
+            labelChunks.push(labels);
+            console.log(`Processing all ${labels.length} labels in single chunk`);
+        }
 
-        await updateProgress(generationId, 60, 'Waiting for content to load...');
-
-        // Wait for dynamic content
-        const waitTime = Math.min(2000 + (labels.length * 100), 10000);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-
-        await updateProgress(generationId, 80, 'Generating PDF...');
-
-        // Convert dimensions
+        // Convert dimensions for PDF generation
         const convertDimension = (value, unit) => {
             switch (unit.toLowerCase()) {
                 case 'in': return `${value}in`;
@@ -147,16 +141,76 @@ app.post('/generate-pdf', async (req, res) => {
         const pdfWidth = convertDimension(dimensions.width, dimensions.unit);
         const pdfHeight = convertDimension(dimensions.height, dimensions.unit);
 
-        console.log('Generating PDF...');
-        const pdf = await page.pdf({
-            width: pdfWidth,
-            height: pdfHeight,
-            margin: { top: '0px', right: '0px', bottom: '0px', left: '0px' },
-            printBackground: true,
-            preferCSSPageSize: false
-        });
+        // Array to store PDF buffers for merging
+        const pdfBuffers = [];
+        const progressStep = Math.floor(50 / labelChunks.length); // 50% of progress for processing chunks
 
-        console.log(`PDF generated successfully: ${pdf.length} bytes for ${labels.length} labels`);
+        // Process each chunk
+        for (let chunkIndex = 0; chunkIndex < labelChunks.length; chunkIndex++) {
+            const chunk = labelChunks[chunkIndex];
+            const currentProgress = 30 + (chunkIndex * progressStep);
+
+            await updateProgress(generationId, currentProgress, `Processing chunk ${chunkIndex + 1}/${labelChunks.length} (${chunk.length} labels)...`);
+
+            console.log(`Processing chunk ${chunkIndex + 1}/${labelChunks.length} with ${chunk.length} labels`);
+
+            // Construct print URL for this chunk
+            const printUrl = new URL('https://lavvel.sanflavva.com/print-labels');
+            printUrl.searchParams.set('templateType', templateType);
+            printUrl.searchParams.set('dimensions', JSON.stringify(dimensions));
+            printUrl.searchParams.set('labels', JSON.stringify(chunk));
+            printUrl.searchParams.set('barcodeSource', barcodeSource);
+
+            console.log(`Navigating to print route for chunk ${chunkIndex + 1}...`);
+            await page.goto(printUrl.toString(), {
+                waitUntil: 'networkidle0',
+                timeout: 60000
+            });
+
+            // Wait for dynamic content (adjusted for chunk size)
+            const waitTime = Math.min(2000 + (chunk.length * 100), 10000);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+
+            // Generate PDF for this chunk
+            const chunkPdf = await page.pdf({
+                width: pdfWidth,
+                height: pdfHeight,
+                margin: { top: '0px', right: '0px', bottom: '0px', left: '0px' },
+                printBackground: true,
+                preferCSSPageSize: false
+            });
+
+            pdfBuffers.push(chunkPdf);
+            console.log(`Chunk ${chunkIndex + 1} PDF generated: ${chunkPdf.length} bytes`);
+        }
+
+        await updateProgress(generationId, 80, 'Merging PDF chunks...');
+
+        // Merge PDFs if multiple chunks, otherwise use single PDF
+        let finalPdf;
+        if (pdfBuffers.length === 1) {
+            finalPdf = pdfBuffers[0];
+            console.log('Single chunk PDF, no merging needed');
+        } else {
+            console.log(`Merging ${pdfBuffers.length} PDF chunks...`);
+
+            // Create a new PDF document for merging
+            const mergedPdf = await PDFDocument.create();
+
+            // Add pages from each PDF buffer
+            for (let i = 0; i < pdfBuffers.length; i++) {
+                const pdfDoc = await PDFDocument.load(pdfBuffers[i]);
+                const pages = await mergedPdf.copyPages(pdfDoc, pdfDoc.getPageIndices());
+                pages.forEach((page) => mergedPdf.addPage(page));
+                console.log(`Merged chunk ${i + 1}/${pdfBuffers.length}`);
+            }
+
+            // Serialize the merged PDF
+            finalPdf = await mergedPdf.save();
+            console.log(`PDF merging completed: ${finalPdf.length} bytes`);
+        }
+
+        console.log(`PDF generated successfully: ${finalPdf.length} bytes for ${labels.length} labels`);
 
         await updateProgress(generationId, 100, 'PDF generated successfully');
 
@@ -167,7 +221,7 @@ app.post('/generate-pdf', async (req, res) => {
                 status: 'completed',
                 error_message: null,
                 processed_at: new Date().toISOString(),
-                pdf_size: pdf.length
+                pdf_size: finalPdf.length
             })
             .eq('id', generationId);
 
@@ -175,9 +229,9 @@ app.post('/generate-pdf', async (req, res) => {
         res.set({
             'Content-Type': 'application/pdf',
             'Content-Disposition': `attachment; filename="labels_${new Date().toISOString().slice(0, 10)}.pdf"`,
-            'Content-Length': pdf.length
+            'Content-Length': finalPdf.length
         });
-        res.send(pdf);
+        res.send(finalPdf);
 
     } catch (error) {
         console.error('PDF generation error:', error);
