@@ -113,8 +113,8 @@ app.post('/generate-pdf', async (req, res) => {
         // Optimize page
         await page.setViewport({ width: 1200, height: 800 });
 
-        // Split labels into chunks of 20 if more than 20 labels
-        const chunkSize = 20;
+        // Split labels into chunks of 50 if more than 50 labels
+        const chunkSize = 50;
         const labelChunks = [];
 
         if (labels.length > chunkSize) {
